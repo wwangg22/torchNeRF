@@ -10,6 +10,7 @@ import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import time
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -92,7 +93,7 @@ if scene_type == "synthetic":
             pool.join()
 
         # Stack => shape [N, H, W, 4]
-        images = torch.stack(images, dim=0).to(device)
+        images = torch.stack(images, dim=0)
 
         # Convert RGBA -> RGB, optionally with white background
         if white_bkgd:
@@ -138,6 +139,7 @@ if scene_type == "synthetic":
         plt.axis("equal")
         plt.savefig(samples_dir + f"/training_camera{i}.png")
         plt.close()
+
 
 def matmul(a, b):
     return torch.matmul(a, b)
@@ -212,30 +214,40 @@ def camera_ray_batch(cam2world, hwf):
     return generate_rays(pixel_coords, pix2cam, cam2world)
 
 def random_ray_batch(batch_size, data):
-    """
-    rng: if not None, set torch.manual_seed(rng).
-    data: dict with 'images', 'c2w', 'hwf' on device
-    """
+    images_cpu = data["images"]   # shape [N, H, W, 3] on CPU
+    c2w = data["c2w"].to(device)  # shape [N, 4, 4] on GPU
+    hwf = data["hwf"].to(device)
 
-    images = data["images"]  # shape [N, H, W, 3], device
-    c2w = data["c2w"]        # shape [N, 4, 4], device
-    hwf = data["hwf"]        # shape [3], device
-    device_ = images.device
+    N, H, W, _ = images_cpu.shape
 
-    N = c2w.shape[0]
-    H, W = images.shape[1], images.shape[2]
+    # Pick random indices
+    cam_ind = torch.randint(low=0, high=N, size=(batch_size,), device=device)
+    y_ind   = torch.randint(low=0, high=H, size=(batch_size,), device=device)
+    x_ind   = torch.randint(low=0, high=W, size=(batch_size,), device=device)
 
-    cam_ind = torch.randint(low=0, high=N, size=(batch_size,), device=device_)
-    y_ind = torch.randint(low=0, high=H, size=(batch_size,), device=device_)
-    x_ind = torch.randint(low=0, high=W, size=(batch_size,), device=device_)
+    # Grab pixel values on CPU, then send those values to GPU
+    # (We index the CPU tensor via numpy-like advanced indexing.)
+    # Careful: we need .cpu() indexing or .numpy() indexing if 'cam_ind' is on GPU.
+    # One approach is to do the indexing with plain Python or move 'cam_ind' to CPU:
+    cam_ind_cpu = cam_ind.cpu()
+    y_ind_cpu   = y_ind.cpu()
+    x_ind_cpu   = x_ind.cpu()
 
+    pixels_cpu  = images_cpu[cam_ind_cpu, y_ind_cpu, x_ind_cpu]  # still on CPU
+    pixels      = pixels_cpu.to(device)                          # move to GPU
+
+    # The next part: generating the rays
+    # We'll keep pix2cam on GPU
+    # etc...
+    pix2cam = pix2cam_matrix(hwf[0].item(), hwf[1].item(), hwf[2].item(), device)
+
+    chosen_c2w = c2w[cam_ind, :3, :4]  # [batch_size, 3, 4] on GPU
+
+    # pixel_coords => also needs to be on GPU
+    # but 'x_ind' and 'y_ind' are already on GPU (assuming you did torch.randint(..., device=device)).
     pixel_coords = torch.stack([x_ind, y_ind], dim=-1).float()  # [batch_size, 2]
-
-    pix2cam = pix2cam_matrix(hwf[0].item(), hwf[1].item(), hwf[2].item(), device_)
-    chosen_c2w = c2w[cam_ind, :3, :4]  # [batch_size, 3, 4]
-
-    rays = generate_rays(pixel_coords, pix2cam, chosen_c2w)  # (origins, dirs)
-    pixels = images[cam_ind, y_ind, x_ind]  # [batch_size, 3]
+    # Now generate rays on GPU
+    rays = generate_rays(pixel_coords, pix2cam, chosen_c2w)
 
     return rays, pixels
 
@@ -277,7 +289,7 @@ if scene_type == "synthetic":
 
     grid_min = torch.tensor([-1, -1, -1], dtype=torch.float32, device=device) * scene_grid_scale
     grid_max = torch.tensor([ 1,  1,  1], dtype=torch.float32, device=device) * scene_grid_scale
-    point_grid_size = 128
+    point_grid_size = 64
 
     def get_taper_coord(p):
         return p
@@ -285,7 +297,7 @@ if scene_type == "synthetic":
     def inverse_taper_coord(p):
         return p
 
-grid_dtype = torch.float32
+grid_dtype = torch.float16
 
 # plane parameter grid (on device)
 point_grid = torch.zeros(
@@ -378,7 +390,7 @@ if scene_type == "synthetic":
         ty = ty * (1 - dym) + 1000 * dym
         tz = tz * (1 - dzm) + 1000 * dzm
 
-        txyz = torch.cat([tx, ty, tz], dim=-1)
+        txyz = torch.stack([tx, ty, tz], dim=-1)
 
         # txyz <= 0 => set to large
         neg_mask = (txyz <= 0).float()
@@ -386,9 +398,13 @@ if scene_type == "synthetic":
 
         # + small_step
         txyz = txyz + small_step
-
+        # print("ray_origins shape:", ray_origins.shape)
+        # print("txyz shape:", txyz.shape)
+        # print("ray_origins.unsqueeze(-2) shape:", ray_origins.unsqueeze(-2).shape)
+        # print("txyz.unsqueeze(-1) shape:", txyz.unsqueeze(-1).shape)
+        # print("ray.unsqueeze(-2 )", ray_directions.unsqueeze(-2).shape)
         # world_positions => [..., point_grid_size+1, 3]
-        world_positions = ray_origins.unsqueeze(-2) + ray_directions.unsqueeze(-2) * txyz.unsqueeze(-1)
+        world_positions = ray_origins.unsqueeze(-2) + ray_directions.unsqueeze(-2) * txyz
         acc_grid_masks = get_acc_grid_masks(world_positions, acc_grid)
 
         # remove empty cells
@@ -399,11 +415,11 @@ if scene_type == "synthetic":
         txyz_sorted, _ = torch.sort(txyz, dim=-1)
         # keep first 'keep_num'
         txyz_clipped = txyz_sorted[..., :keep_num]
-
+        # print("TXYZ CLIPPED ", txyz_clipped.shape)
         # Recompute positions
         world_positions_final = (
             ray_origins.unsqueeze(-2) +
-            ray_directions.unsqueeze(-2) * txyz_clipped.unsqueeze(-1)
+            ray_directions.unsqueeze(-2) * txyz_clipped
         )
 
         # Convert to grid coords
@@ -511,15 +527,7 @@ def compute_undc_intersection(
     cell_xyz,                 # shape [..., 3], on device (int indices)
     masks,                    # shape [...], boolean or float, on device
     rays,                     # Tuple(Tensor, Tensor) -> (ray_origins, ray_directions), each [..., 3]
-    keep_num,                 # int
-    grid_max, grid_min,       # Tensors or floats
-    point_grid_size,          # int
-    cell_size_x, cell_size_y, cell_size_z,  # floats
-    point_grid_diff_lr_scale, # float
-    inverse_taper_coord,
-    get_taper_coord,
-    get_barycentric,
-    get_inside_cell_mask
+    keep_num                 # int
 ):
     """
     PyTorch version of 'compute_undc_intersection', fully on a chosen device.
@@ -668,7 +676,10 @@ def compute_undc_intersection(
     def tri_intersect_and_mask(p1, p2, p3):
         a, b, c, mask_ = get_barycentric(p1, p2, p3, o, d)
         P_ = p1 * a.unsqueeze(-1) + p2 * b.unsqueeze(-1) + p3 * c.unsqueeze(-1)
-        inside_mask = get_inside_cell_mask(P_, ooxyz) & mask_ & masks.unsqueeze(-1)
+        # print("mask_", mask_.shape)
+        # print("masks.unsqueeze(-1 )", masks.unsqueeze(-1).shape)
+        # print("get inside cell mask ", get_inside_cell_mask(P_, ooxyz).shape)
+        inside_mask = get_inside_cell_mask(P_, ooxyz) & mask_ & masks
         return P_, inside_mask
 
     # ------ X faces ------
@@ -969,8 +980,8 @@ class MLP(nn.Module):
         out = self.model(x)
         return out
 
-density_model = RadianceField(1)
-feature_model = RadianceField(num_bottleneck_features)
+density_model = RadianceField(1, config)
+feature_model = RadianceField(num_bottleneck_features, config)
 color_model = MLP(input_dim = 11, output_dim=3, config=config_mlp)
 sigmoid = nn.Sigmoid()
 # point_grid = None
@@ -1013,9 +1024,15 @@ def render_rays(rays, point_grid, acc_grid, keep_num, threshold):
 
     pts, grid_masks, points, fake_t = compute_undc_intersection(point_grid, 
                                                             grid_indices, grid_masks, rays, keep_num)
-
-    mlp_alpha = density_model(pts)
-    mlp_alpha = sigmoid(mlp_alpha[..., 0] - 8)
+    # print("rendering rays!")
+    B, R, S, C = pts.shape
+    pts_flat = pts.view(-1, C)
+    # print("points shape ", pts_flat.shape)
+    mlp_alpha_flat = density_model(pts_flat)
+    mlp_alpha_flat = sigmoid(mlp_alpha_flat[..., 0] - 8)
+    mlp_alpha = mlp_alpha_flat.view(B, R, S)
+    # print("grid_masks shape ", grid_masks.shape)
+    # print(" mlp alpha ", mlp_alpha.shape)
     mlp_alpha = mlp_alpha * grid_masks
 
     weights = compute_volumetric_rendering_weights_with_alpha(mlp_alpha)
@@ -1028,11 +1045,19 @@ def render_rays(rays, point_grid, acc_grid, keep_num, threshold):
     acc_b = torch.sum(weights_b, axis=-1)
 
     dirs = normalize(rays[1])
-    dirs = torch.braodcast_to(dirs[..., None, :], pts.shape)
+    dirs = dirs.unsqueeze(2).expand(-1, -1, pts.shape[2], -1)
+    # print("dirs shape", dirs.shape)
+    # print("rays 1 ", rays[1].shape)
 
-    mlp_features = sigmoid(feature_model(pts))
+    mlp_features_flat = sigmoid(feature_model(pts_flat))
+    mlp_features = mlp_features_flat.view(B, R, S, -1)
     features_dir_enc = torch.concatenate([mlp_features, dirs], axis=-1)
-    colors = sigmoid(color_model(features_dir_enc))
+    # print("Features dic ecn ", features_dir_enc.shape)
+    features_dir_enc_flat = features_dir_enc.view(-1, 11)
+    colors_flat = sigmoid(color_model(features_dir_enc_flat))
+
+    colors = colors_flat.view(B, R, S, -1)
+    # print("colors shape ", colors.shape)
 
     rgb = torch.sum(weights[..., None] * colors, axis=-2)
     rgb_b = torch.sum(weights_b[..., None] * colors, axis=-2)
@@ -1050,8 +1075,9 @@ def render_rays(rays, point_grid, acc_grid, keep_num, threshold):
 #%% --------------------------------------------------------------------------------
 # ## Set up pmap'd rendering for test time evaluation.
 #%%
-test_batch_size = 1024
-test_keep_num = point_grid_size*3//4
+test_batch_size = 2
+test_keep_num = point_grid_size*3//16
+print("test_keep_num ", test_keep_num)
 test_threshold = 0.1
 test_wbgcolor = 0.0
 
@@ -1062,13 +1088,14 @@ def render_test(rays, point_grid, acc_grid):
     sh = rays[0].shape
     rays = [x.reshape((1, -1) + sh[1:]) for x in rays]
     out = render_test_p(rays, point_grid, acc_grid)
-    out = [np.reshape(np.array(x.detach().cpu()),sh[:-1]+(-1,)) for x in out]
+    # out = [np.reshape(np.array(x.detach().cpu()),sh[:-1]+(-1,)) for x in out]
     return out
 
 def render_loop(rays, point_grid, acc_grid, chunk):
     sh = list(rays[0].shape[:-1])
     rays = [x.reshape([-1,3]) for x in rays]
     l = rays[0].shape[0]
+    print("rays shape", rays[0].shape)
     n = 1
     p = ((l-1) // n + 1) * n - l
     rays = [F.pad(x, (0, 0, 0, p)) for x in rays]
@@ -1079,12 +1106,162 @@ def render_loop(rays, point_grid, acc_grid, chunk):
     
     return outs
 
+def chunked_train_step(
+    traindata,
+    lr,
+    wdistortion,
+    batch_size=2048,      # total rays per train step
+    chunk_size=256,       # how many rays to render at once
+):
+    """
+    1) Sample 'batch_size' rays via random_ray_batch.
+    2) Split them into chunks of 'chunk_size' each.
+    3) For each chunk, call 'render_rays' & compute your losses,
+       then do partial backward (gradient accumulation).
+    4) At the end, do a single optimizer step.
+    """
+    # =======================
+    #  Gather a batch of rays
+    # =======================
+    # e.g. batch_size=2048 -> 2k rays in total
+    rays, pixels = random_ray_batch(batch_size, traindata)  # your existing function
+
+    # rays[0] => shape [batch_size, 3] (origins)
+    # rays[1] => shape [batch_size, 3] (dirs)
+    # pixels => shape [batch_size, 3]
+
+    # =========================
+    #  Adjust the learning rate
+    # =========================
+    for param_group in density_model.optimizer.param_groups:
+        param_group["lr"] = lr
+    for param_group in feature_model.optimizer.param_groups:
+        param_group["lr"] = lr
+    for param_group in color_model.optimizer.param_groups:
+        param_group["lr"] = lr
+
+    # ================================
+    #  Zero the grads before we start
+    # ================================
+    density_model.optimizer.zero_grad()
+    feature_model.optimizer.zero_grad()
+    color_model.optimizer.zero_grad()
+
+    # We'll track total losses over all chunks
+    total_loss_acc = 0.0
+    color_loss_acc = 0.0
+
+    # We'll also do a single backward pass per chunk. 
+    # Then after all chunks, we do "optimizer.step()".
+    # That means we want to scale each chunk's loss 
+    # so the overall gradient is consistent with a single big batch.
+    # scale_factor = chunk_size / batch_size for each chunk.
+
+    n_rays_total = rays[0].shape[0]  # should equal 'batch_size'
+    num_chunks = (n_rays_total + chunk_size - 1) // chunk_size
+
+    # ============================================
+    #  Loop over all rays in chunked mini-batches
+    # ============================================
+    for chunk_i in range(num_chunks):
+        start = chunk_i * chunk_size
+        end   = min(start + chunk_size, n_rays_total)
+        this_count = end - start  # how many rays in this chunk
+
+        # Slice out the chunk for origins, dirs, and pixels
+        sub_origins = rays[0][start:end]  # shape [this_count, 3]
+        sub_dirs    = rays[1][start:end]
+        sub_pixels  = pixels[start:end]   # shape [this_count, 3]
+
+        # We pass them to 'render_rays' with shape [1, this_count, 3],
+        # because your code expects [B, R, 3], so we do B=1:
+        rays_chunk = (
+            sub_origins.unsqueeze(0),  # => [1, this_count, 3]
+            sub_dirs.unsqueeze(0),     # => [1, this_count, 3]
+        )
+
+        # ==============
+        #  Forward pass
+        # ==============
+        with autocast():
+            # This calls your existing "render_rays" function
+            # which returns (rgb, acc, rgb_b, acc_b, mlp_alpha, weights, points, fake_t, acc_grid_masks)
+            rgb_est, _, rgb_est_b, _, mlp_alpha, weights, points, fake_t, acc_grid_masks = render_rays(
+                rays_chunk, point_grid, acc_grid, test_keep_num, test_threshold
+            )
+
+            # rgb_est => shape [1, this_count, 3]
+            # We'll squeeze out the batch dim:
+            rgb_est_squeezed = rgb_est[0]  # => [this_count, 3]
+
+            # ===============
+            #  Compute losses
+            # ===============
+            # 1) color loss
+            loss_color_l2 = torch.mean((rgb_est_squeezed - sub_pixels)**2)
+
+            # 2) coverage/acc loss
+            loss_acc = torch.mean(torch.clamp(weights.detach() - acc_grid_masks, min=0))
+            loss_acc += torch.mean(torch.abs(acc_grid)) * 1e-5
+            loss_acc += compute_TV(acc_grid) * 1e-5
+
+            # 3) distortion
+            loss_distortion = torch.mean(lossfun_distortion(fake_t, weights)) * wdistortion
+
+            # 4) point_loss
+            point_loss = torch.abs(points)
+            point_loss_out = point_loss * 1000.0
+            point_loss_in  = point_loss * 0.01
+            point_mask = point_loss < (grid_max - grid_min) / point_grid_size / 2
+            point_loss = torch.mean(torch.where(point_mask, point_loss_in, point_loss_out))
+
+            # Combine them
+            total_loss_chunk = (loss_color_l2 + loss_distortion + loss_acc + point_loss)
+
+        # ===========================
+        #  Scale + backward per chunk
+        # ===========================
+        # We'll scale this chunk's loss so the final gradient matches 
+        # a single large batch. That means multiplying by (this_count / batch_size).
+        scale_factor = float(this_count) / float(n_rays_total)
+        scaled_loss  = total_loss_chunk * scale_factor
+
+        scaler.scale(scaled_loss).backward()
+
+        # Keep track of the *unscaled* loss values for logging
+        total_loss_acc  += total_loss_chunk.item() * this_count
+        color_loss_acc  += loss_color_l2.item()      * this_count
+
+        # After this chunk finishes, the big intermediate Tensors 
+        # (pts, weights, acc_grid_masks, etc.) go out of scope 
+        # and can be freed by PyTorch.
+
+    # end of chunk loop
+
+    # ==========================
+    #  Single optimizer step now
+    # ==========================
+    scaler.step(density_model.optimizer)
+    scaler.step(feature_model.optimizer)
+    scaler.step(color_model.optimizer)
+    scaler.update()
+
+    # We can zero_grad here or in the next iteration
+    density_model.optimizer.zero_grad()
+    feature_model.optimizer.zero_grad()
+    color_model.optimizer.zero_grad()
+
+    # Compute final average losses for logging
+    final_total_loss  = total_loss_acc  / n_rays_total
+    final_color_loss  = color_loss_acc  / n_rays_total
+
+    return final_total_loss, final_color_loss
 
 if scene_type=="synthetic":
   selected_test_index = 97
   preview_image_height = 800
 
-
+print("testing rays")
 rays = camera_ray_batch(
     data['test']['c2w'][selected_test_index], data['test']['hwf'])
 gt = data['test']['images'][selected_test_index]
@@ -1104,36 +1281,42 @@ write_floatpoint_image(samples_dir+"/s1_"+str(0)+"_acc_binarized.png",acc_b)
 # ## Training loop
 #%%
 
-def lossfun_distortion(x,w):
-    """Compute iint w_i w_j |x_i - x_j| d_i d_j."""
-    # The loss incurred between all pairs of intervals.
+##############################################################################
+# Training loop with AMP
+##############################################################################
+def lossfun_distortion(x, w):
     dux = torch.abs(x[..., :, None] - x[..., None, :])
     losses_cross = torch.sum(w * torch.sum(w[..., None, :] * dux, axis=-1), axis=-1)
-
-    # The loss incurred within each individual interval with itself.
-    losses_self = torch.sum((w[..., 1:] ** 2 + w[..., :-1]**2) *\
-                            (x[...,1:] - x[..., :-1]), axis=-1) /6
+    losses_self = torch.sum(
+        (w[..., 1:]**2 + w[..., :-1]**2)*(x[...,1:] - x[..., :-1]),
+        axis=-1
+    ) / 6
     return losses_cross + losses_self
 
 def compute_TV(acc_grid):
-  dx = acc_grid[:-1,:,:] - acc_grid[1:,:,:]
-  dy = acc_grid[:,:-1,:] - acc_grid[:,1:,:]
-  dz = acc_grid[:,:,:-1] - acc_grid[:,:,1:]
-  TV = torch.mean(torch.square(dx))+torch.mean(torch.square(dy))+torch.mean(torch.square(dz))
-  return TV
+    dx = acc_grid[:-1,:,:] - acc_grid[1:,:,:]
+    dy = acc_grid[:,:-1,:] - acc_grid[:,1:,:]
+    dz = acc_grid[:,:,:-1] - acc_grid[:,:,1:]
+    TV = torch.mean(dx**2) + torch.mean(dy**2) + torch.mean(dz**2)
+    return TV
+
+# -------------------- CHANGED: Create a GradScaler for AMP --------------------
+scaler = GradScaler()
 
 def train_step(traindata, lr, wdistortion):
-    rays, pixels = random_ray_batch(
-        test_batch_size//1, traindata)
-    
+    # Example: pick a batch
+    rays, pixels = random_ray_batch(16, traindata)
+    # print("size of rays ", rays.shape)
+    # print("size of pixels ", pixels.shape)
+
+    # We'll define the forward pass in an inner function
     def loss_fn():
         rgb_est, _, rgb_est_b, _, mlp_alpha, weights, points, fake_t, acc_grid_masks = render_rays(
-        rays, point_grid, acc_grid, test_keep_num, test_threshold)
+            rays, point_grid, acc_grid, test_keep_num, test_threshold
+        )
 
-        loss_color_l2 = torch.mean(torch.square(rgb_est - pixels))
-
-        loss_acc = torch.mean(torch.maximum(weights.detach() - acc_grid_masks, 0))
-
+        loss_color_l2 = torch.mean((rgb_est - pixels)**2)
+        loss_acc = torch.mean(torch.clamp(weights.detach() - acc_grid_masks, min=0))
         loss_acc += torch.mean(torch.abs(acc_grid)) * 1e-5
         loss_acc += compute_TV(acc_grid) * 1e-5
 
@@ -1143,81 +1326,61 @@ def train_step(traindata, lr, wdistortion):
         point_loss_out = point_loss * 1000.0
         point_loss_in = point_loss * 0.01
         point_mask = point_loss < (grid_max - grid_min) / point_grid_size/2
-        point_loss = torch.mean(torch.where(point_mask, point_loss_in, point_loss_out))
-
+        point_loss = torch.mean(
+            torch.where(point_mask, point_loss_in, point_loss_out)
+        )
         return loss_color_l2 + loss_distortion + loss_acc + point_loss, loss_color_l2
 
-    total_loss, color_loss_l2 = loss_fn()
+    # -------------------- CHANGED: use autocast + GradScaler --------------------
+    with autocast():
+        total_loss, color_loss_l2 = loss_fn()
 
-    for param_group in color_model.optimizer.param_groups:
-        param_group["lr"] = lr
-    for param_group in density_model.optimizer.param_groups:
-        param_group["lr"] = lr
-    for param_group in feature_model.optimizer.param_groups:
-        param_group["lr"] = lr
-     # Zero grads
-    color_model.optimizer.zero_grad()
     density_model.optimizer.zero_grad()
     feature_model.optimizer.zero_grad()
+    color_model.optimizer.zero_grad()
 
-    # Backprop
-    total_loss.backward()
+    # Instead of total_loss.backward(), we do scaled backward:
+    scaler.scale(total_loss).backward()
 
-    # Step the optimizer
-    color_model.optimizer.step()
-    density_model.optimizer.step()
-    feature_model.optimizer.step()
+    # Step each optimizer
+    scaler.step(density_model.optimizer)
+    scaler.step(feature_model.optimizer)
+    scaler.step(color_model.optimizer)
+    scaler.update()
 
     return total_loss.item(), color_loss_l2.item()
 
+##############################################################################
+# Main training loop
+##############################################################################
 step_init = 0
-psnrs = []
-iters = []
-psnrs_test = []
-iters_test = []
-t_total = 0.0
-t_last = 0.0
-i_last = step_init
-
-traindata = data['train']
 training_iters = 200000
 train_iters_cont = 300000
 
+traindata = data['train']
 print("training")
+
 for i in tqdm(range(step_init, training_iters + 1)):
-    t = time.time()
+    lr = lr_fn(i, train_iters_cont, 1e-3, 1e-5)
+    wdistortion = 0.0  # etc.
 
-    lr = lr_fn(i,train_iters_cont, 1e-3, 1e-5)
-    wbgcolor = min(1.0, float(i)/50000)
-    wbinary = 0.0
-    if scene_type=="synthetic":
-        wdistortion = 0.0
-    
-    if i<=50000:
-        batch_size = test_batch_size//4
-        keep_num = test_keep_num*4
-        threshold = -100000.0
-    elif i<=100000:
-        batch_size = test_batch_size//2
-        keep_num = test_keep_num*2
-        threshold = test_threshold
-    else:
-        batch_size = test_batch_size
-        keep_num = test_keep_num
-        threshold = test_threshold
-    
-    total_loss, color_loss = train_step(traindata, lr, wdistortion)
+    # Adjust the learning rate
+    # for param_group in color_model.optimizer.param_groups:
+    #     param_group["lr"] = lr
+    # for param_group in density_model.optimizer.param_groups:
+    #     param_group["lr"] = lr
+    # for param_group in feature_model.optimizer.param_groups:
+    #     param_group["lr"] = lr
 
-    psnrs.append(-10. * torch.log10(color_loss))
-    iters.append(i)
+    # total_loss, color_loss = train_step(traindata, lr, wdistortion)
 
-    if i > 0:
-        t_total += time.time() - t
-    print(total_loss, color_loss)
-    
+    total_loss, color_loss = chunked_train_step(
+            traindata,
+            lr,
+            wdistortion,
+            batch_size=16,   # total rays
+            chunk_size=4,    # chunk at a time
+        )
 
 
-
-
-    
-
+    print(i, total_loss, color_loss)
