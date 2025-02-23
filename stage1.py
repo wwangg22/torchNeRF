@@ -147,28 +147,6 @@ def matmul(a, b):
 def normalize(x):
     return x / (x.norm(dim=-1, keepdim=True) + 1e-8)
 
-
-def sinusoidal_encoding(position, minimum_frequency_power,
-                        maximum_frequency_power, include_identity=False):
-    """
-    position: shape [..., D], on device
-    """
-    freqs = 2.0 ** torch.arange(minimum_frequency_power,
-                                maximum_frequency_power,
-                                dtype=position.dtype,
-                                device=position.device)
-    # angle => [..., num_freqs, D]
-    angle = position.unsqueeze(-2) * freqs.unsqueeze(-1)
-    # sin_cos => [..., 2, num_freqs, D]
-    sin_cos = torch.stack([torch.sin(angle), torch.sin(angle + 0.5 * math.pi)], dim=-3)
-    # Flatten
-    sin_cos = sin_cos.view(*position.shape[:-1], -1)
-
-    if include_identity:
-        sin_cos = torch.cat([position, sin_cos], dim=-1)
-    return sin_cos
-
-
 ##############################################################################
 # 7) Ray generation (Torch)
 ##############################################################################
@@ -178,6 +156,10 @@ def generate_rays(pixel_coords, pix2cam, cam2world):
     pix2cam: shape [3, 3], on device
     cam2world: shape [..., 3, 4], on device
     """
+    assert pixel_coords.shape[-1] == 2, "Pixel coordinates should have shape [..., 2]."
+    assert pix2cam.shape == (3, 3), "Pix2cam should have shape [3, 3]."
+    assert cam2world.shape[-2:] == (3, 4), "Cam2world should have shape [..., 3, 4]."
+
     homog = torch.ones_like(pixel_coords[..., :1])  # same shape as pixel_coords[..., :1]
     pixel_dirs = torch.cat([pixel_coords + 0.5, homog], dim=-1)[..., None]  # => [..., 3, 1]
 
@@ -201,6 +183,7 @@ def camera_ray_batch(cam2world, hwf):
     cam2world: shape [..., 4, 4], on device
     hwf: [H, W, focal], on device
     """
+
     H, W, f = hwf[0].item(), hwf[1].item(), hwf[2].item()
     pix2cam = pix2cam_matrix(H, W, f, cam2world.device)
 
@@ -809,46 +792,6 @@ def compute_t_forwardfacing(taper_positions, world_masks, grid_max):
 #   - Replaces np.argsort with torch.argsort and np.take_along_axis with torch.gather.
 ##############################################################################
 
-def sort_and_compute_t_real360(taper_positions, world_masks):
-    """
-    Similar to `compute_t_forwardfacing` but with a fixed offset = 2.0,
-    and then sorts the results.
-
-    taper_positions: (Tensor) shape [..., N, 3], on device
-    world_masks:     (Tensor) shape [..., N], boolean or float
-    Returns:
-        taper_positions: re-sorted positions
-        world_masks:     re-sorted mask
-        world_tx:        sorted distances (detached)
-    """
-    device = taper_positions.device
-    dtype = taper_positions.dtype
-
-    # offset = (1 - mask) * 2.0
-    offset = (1.0 - world_masks.unsqueeze(-1)) * 2.0
-    diff = taper_positions + offset - taper_positions[..., :1, :]
-
-    # shape [..., N]
-    world_tx = diff.square().sum(dim=-1).sqrt()
-
-    # argsort => shape [..., N]
-    ind = torch.argsort(world_tx, dim=-1)
-
-    # gather the distances
-    # shape => [..., N]
-    world_tx_sorted = torch.gather(world_tx, dim=-1, index=ind)
-
-    # gather the masks => shape [..., N]
-    world_masks_sorted = torch.gather(world_masks, dim=-1, index=ind)
-
-    # gather the positions => shape [..., N, 3]
-    # expand the index => [..., N, 1]
-    ind_expanded = ind.unsqueeze(-1).expand(*ind.shape, 3)
-    taper_positions_sorted = torch.gather(taper_positions, dim=-2, index=ind_expanded)
-
-    return taper_positions_sorted, world_masks_sorted, world_tx_sorted.detach()
-
-
 ##############################################################################
 # 3) compute_box_intersection
 #
@@ -1125,7 +1068,8 @@ def chunked_train_step(
     # =======================
     # e.g. batch_size=2048 -> 2k rays in total
     rays, pixels = random_ray_batch(batch_size, traindata)  # your existing function
-
+    for r in rays:
+        print("r shape",r.shape)
     # rays[0] => shape [batch_size, 3] (origins)
     # rays[1] => shape [batch_size, 3] (dirs)
     # pixels => shape [batch_size, 3]
